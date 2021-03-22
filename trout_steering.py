@@ -5,8 +5,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.signal
 from scipy.special import logit, expit
+from scipy.interpolate import interp1d
 
 from linestring import LineLoop, simplify_linestring, extrude_linestring
+from purepursuit import simulate_pursuiter
+import purepursuit
 
 @dataclass
 class Track:
@@ -28,8 +31,8 @@ def get_track(midline, lanewidth, targets):
     for _, target in targets.iterrows():
         pos = target[['xcentre', 'zcentre']].values
         dist = midpath.project(pos)
-        r = target.target_radius
-        include = include & (np.abs(midpath.dist - dist) > 2*r)
+        r = target.centre_radius
+        #include = include & (np.abs(midpath.dist - dist) > 2*r)
         for d in np.array([-r, r]):
             #targetpoints.append([1.2*d + dist, midpath.interpolate(1.2*d + dist), lanewidth])
             targetpoints.append([1.01*d + dist, midpath.interpolate(1.01*d + dist), lanewidth])
@@ -59,12 +62,16 @@ def get_track(midline, lanewidth, targets):
     midpath = LineLoop(midline)
 
     track = Track(midpath, [inside, outside, *boundaries])
-    track.orig_midpath = midpath
+    track.orig_midpath = orig_midpath
+    track.targets = targets
     return track
 
-def tangent_ttlc(pos, heading, speed, path, minimum=0.3):
+"""
+
+def tangent_ttlc(pos, heading, speed, path, offset=0.0, minimum=0.1):
     s = (path[:,0] - pos[0]) + 1.0j*(path[:,1] - pos[1])
     s *= np.exp(heading*1j)
+    s -= offset
     l = np.diff(s)
     s = s[:-1]
     
@@ -146,9 +153,8 @@ def simulate_pursuiter(dt, sensor_alpha, motor_alpha, noise, track, pos, heading
         pos += direction*speed*dt
         heading += yawrate*dt
         t += dt
+"""
 
-
-from purepursuit import simulate_pursuiter
 
 def get_condition_track(condition):
     track = pd.read_csv('trout/track_with_edges.csv')
@@ -162,7 +168,18 @@ def test_steering():
     track = get_condition_track(1)
     speed = 8
     dt = 1/60
-    pursuiter = simulate_pursuiter(dt, 0.15, 0.1, np.radians(2), track, track.midpath.interpolate(0), 0.0, speed, 0.0)
+    alpha = 0.058
+    #alpha = 0.1
+    std = 6.33e-4
+    noise = std*np.sqrt((2 - alpha)/alpha)
+    print(np.degrees(noise))
+    beta = 0.2
+    
+    alpha = 0.1
+    beta = 0.1
+    noise = np.radians(3.0)
+
+    pursuiter = simulate_pursuiter(dt, alpha, beta, noise, track, track.midpath.interpolate(0), 0.0, speed, 0.0)
     data = [next(pursuiter) for i in range(int(120/dt))]
     print("Steering")
     data = [next(pursuiter) for i in range(int(120/dt))]
@@ -225,9 +242,16 @@ def compare_model(data, track, p):
         yr = -np.radians(td.yawrate.values)
         dist = track.orig_midpath.project(pos)
         
-        p = [0.1, 0.1]
-        for i in range(1):
-            pursuiter = simulate_pursuiter(dt, *p, np.radians(0.2)/dt, track,
+        #alpha = 0.5
+        #std = 6.33e-4
+        #noise = std*np.sqrt((2 - alpha)/alpha)
+        noise = np.radians(5.0)
+        print(np.degrees(noise))
+        alpha = 0.1
+        beta = 0.1
+        
+        for i in range(10):
+            pursuiter = simulate_pursuiter(dt, alpha, beta, noise, track,
                     pos[0],
                     heading[0],
                     speed,
@@ -275,7 +299,7 @@ def plot_steering():
 
 def fit_steering():
     # TODO: More conditions
-    condition = 1
+    condition = 2
     speed = 8
 
     track = get_condition_track(condition)
@@ -395,8 +419,154 @@ def test_desired_yawrate():
 
         plt.show()
 
+import numba
+@numba.njit
+def argmedioid(xs):
+    min_dist = np.inf
+    min_i = 0
+    N = len(xs)
+    for i in range(N):
+        dist = 0.0
+        for j in range(N):
+            dist += np.linalg.norm(xs[i] - xs[j])
+            if dist > min_dist:
+                break
+        else:
+            min_dist = dist
+            min_i = i
+    return min_i
+
+def plot_steering_aggregates(condition=1):
+    track = get_condition_track(condition)
+    speed = 8
+    dt = 1/60
+    
+    alpha = 0.1
+    beta = 0.1
+    noise = np.radians(5.0)
+    
+    midline = purepursuit.Path(track.midpath.points, track.midpath.dist)
+    edges = tuple(track.edges)
+
+    pyr_interps = []
+    syr_interps = []
+    
+    plp_interps = []
+    slp_interps = []
+    
+    data = pd.read_parquet("trout/trout_again.parquet")
+    data.query("autoflag == 0 and condition == @condition and dataset == 2", inplace=True)
+    #data.ID[data['ID'] == 203] = 503
+    for i, (t, td) in enumerate(data.groupby('trialcode')):
+        #if i > 10: break
+
+        nts = np.arange(*td.currtime.iloc[[0, -1]], dt)
+        pos = td[['posx_mirror', 'posz_mirror']].values
+        heading = np.unwrap(np.radians(td.yaw.values))
+        
+        pos = interp1d(td.currtime.values, pos, axis=0)(nts)
+        heading = interp1d(td.currtime.values, heading, axis=0)(nts)
+        yr = np.gradient(heading, dt)
+        dist = track.orig_midpath.project(pos)
+
+        lane_pos = track.orig_midpath.signed_error(dist, pos)
+        pyr_interps.append(scipy.interpolate.interp1d(dist, yr, bounds_error=False))
+        plp_interps.append(scipy.interpolate.interp1d(dist, lane_pos, bounds_error=False))
+
+        #yr = -np.radians(td.yawrate.values)
+        
+        
+        if td.startingposition.iloc[0] < 0:
+            heading -= np.pi
+        sd = purepursuit.simulate_pursuiter_N(dt, int(300/speed/dt), alpha, beta, noise, midline, edges, pos[0], heading[0], speed, yr[0])
+        sd = np.rec.fromrecords(sd, dtype=[
+            ('ts', float),
+            ('pos', float, 2),
+            ('heading', float),
+            ('speed', float),
+            ('yr', float),
+            ('dyr', float),
+            ])
+
+        sdist = track.orig_midpath.project(sd.pos)
+        slane_pos = track.orig_midpath.signed_error(sdist, sd.pos)
+        syr_interps.append(scipy.interpolate.interp1d(sdist, sd.yr, bounds_error=False))
+        slp_interps.append(scipy.interpolate.interp1d(sdist, slane_pos, bounds_error=False))
+        #pos_interps.append(scipy.interpolate.interp1d(dist, d.yr))
+        #plt.plot(dist, d.yr)
+    
+    #drng = np.arange(0, 300, 0.1)
+    drng = np.arange(
+            np.max([i.x[0] for i in pyr_interps]),
+            np.min([i.x[-1] for i in pyr_interps]),
+            )
+    yrs = np.array([interp(drng) for interp in pyr_interps]).T
+    syrs = np.array([interp(drng) for interp in syr_interps]).T
+    
+    plt.subplot(2,1,1)
+    yr_l, yr_h = np.percentile(yrs, [5, 95], axis=1)
+    plt.fill_between(drng, np.degrees(yr_l), np.degrees(yr_h),
+            color='C0', alpha=0.25, label='Measured 90% range')
+    pm = argmedioid(yrs.T)
+    plt.plot(drng, np.degrees(yrs.T[pm]), color='C0', label='Measured medioid')
+
+
+    syr_l, syr_h = np.percentile(syrs, [5, 95], axis=1)
+    plt.fill_between(drng, np.degrees(syr_l), np.degrees(syr_h),
+            color='C1', alpha=0.25, label='Simulated 90% range')
+    sm = argmedioid(syrs.T)
+    plt.plot(drng, np.degrees(syrs.T[sm]), color='C1', label='Simulated medioid')
+    #plt.xlabel("Track distance (meters)")
+    plt.ylabel("Yaw rate (degrees/second)")
+    plt.xlim(*drng[[0, -1]])
+    plt.ylim(-35, 35)
+    plt.legend()
+
+    
+    plt.subplot(2,1,2)
+    
+    lps = np.array([interp(drng) for interp in plp_interps]).T
+    slps = np.array([interp(drng) for interp in slp_interps]).T
+    
+    lp_l, lp_h = np.percentile(lps, [5, 95], axis=1)
+    plt.fill_between(drng, (lp_l), (lp_h),
+            color='C0', alpha=0.25, label='Measured 90% range')
+    pm = argmedioid(lps.T)
+    plt.plot(drng, (lps.T[pm]), color='C0', label='Measured medioid')
+
+
+    slp_l, slp_h = np.percentile(slps, [5, 95], axis=1)
+    plt.fill_between(drng, (slp_l), (slp_h),
+            color='C1', alpha=0.25, label='Simulated 90% range')
+    sm = argmedioid(slps.T)
+    plt.plot(drng, (slps.T[sm]), color='C1', label='Simulated medioid')
+    plt.xlabel("Track distance (meters)")
+    plt.ylabel("Lane position (meters)")
+
+    for _, target in track.targets.iterrows():
+        pos = target[['xcentre', 'zcentre']].values
+        dist = track.orig_midpath.project(pos)
+        lp = track.orig_midpath.signed_error(dist, pos)
+        #plt.plot(dist, lp, 'ko')
+        plt.gca().add_artist(plt.Circle((dist, lp), target.centre_radius, color='k', alpha=0.3))
+        plt.gca().add_artist(plt.Circle((dist, lp), target.target_radius, color='k', alpha=0.3))
+
+        
+    plt.xlim(*drng[[0, -1]])
+    plt.axhline(0, alpha=0.25, color='black', linestyle='dashed')
+    plt.axhline(-1.5, alpha=0.25, color='black')
+    plt.axhline(1.5, alpha=0.25, color='black')
+    plt.ylim(-1.75, 1.75)
+    #plt.legend()
+
+
+
+    plt.show()
+
+
 if __name__ == '__main__':
     #plot_steering()
     #fit_steering()
     #test_desired_yawrate()
     test_steering()
+    #plot_steering_aggregates()

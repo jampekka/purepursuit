@@ -98,6 +98,7 @@ def circle_pursuit_yawrate(preview, origin, radius, speed, p_x, p_y, heading):
 def step_circular_steering(dt, origin, radius, noise, time_constant, motor_time_constant, preview, speed, m, c):
     # TODO: Doing this in polar coordinates would probably give a nicer
     # approximation
+    # TODO: Do full state augmentation
     alpha = 1 - np.exp(-dt/time_constant)
     motor_alpha = 1 - np.exp(-dt/motor_time_constant)
     Wm, Wc = julier_sigma_weights(len(m))
@@ -197,5 +198,4 @@ def circular_steering_loglik(dt, origin, radius, noise, time_constant, motor_tim
         total += lik
 
     return total
-
 
